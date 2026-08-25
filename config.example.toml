@@ -1,0 +1,19 @@
+# kepos-tact-memory configuration
+#
+# Optional. Flags override these values. The database is created on first use with
+# mode-0700 parents, matching Tact's private local store conventions.
+
+[server]
+bind = "127.0.0.1:8787"
+db = "memory/kepos-tact-memory.sqlite3"
+
+[auth]
+# Authorize every valid Kepos key, trusting the Kepos publisher allowlist as the
+# authorization boundary. Set false to require explicit allow/readonly entries.
+allow_all = false
+
+# Kepos subscriber public keys permitted to use the service.
+# allow = ["<64-hex-subscriber-public-key>"]
+
+# Kepos subscriber public keys restricted to scan/read/list/export (observers).
+# readonly = ["<64-hex-subscriber-public-key>"]
