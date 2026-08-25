@@ -11,13 +11,18 @@ use axum::{
     http::{HeaderMap, Request, StatusCode, header},
 };
 use http_body_util::BodyExt;
-use kepos_tact_memory::auth::{self, KeposPolicy};
+use kepos_tact_memory::auth::{Binding, KeposPolicy};
 use kepos_tact_memory::router::{ServerState, router};
 use serde_json::{Value, json};
+use tact_memory::RemoteRole;
 use tower::ServiceExt;
 
 fn key(byte: u8) -> String {
     format!("{byte:02x}").repeat(32)
+}
+
+fn writer_binding(namespace: &str, keys: Vec<String>) -> Binding {
+    Binding::new(namespace.to_owned(), RemoteRole::Writer, keys).unwrap()
 }
 
 fn app(policy: KeposPolicy) -> (tempfile::TempDir, Router) {
@@ -68,26 +73,20 @@ async fn request(
 #[tokio::test]
 async fn session_reports_protocol_namespace_and_writer_role() {
     let writer = key(0x01);
-    let (_, app) = app(KeposPolicy::new([writer.clone()], [], false));
-    let (status, body, _) = request(
-        &app,
-        "GET",
-        "/v1/session",
-        headers(&writer, &auth::namespace_for(&writer)),
-        None,
-    )
-    .await;
+    let (_, app) = app(KeposPolicy::new([writer_binding("neil", vec![writer.clone()])]).unwrap());
+    let (status, body, _) =
+        request(&app, "GET", "/v1/session", headers(&writer, "neil"), None).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["protocol_version"], json!(1));
-    assert_eq!(body["namespace"], json!(auth::namespace_for(&writer)));
+    assert_eq!(body["namespace"], json!("neil"));
     assert_eq!(body["role"], json!("writer"));
 }
 
 #[tokio::test]
 async fn put_read_scan_list_export_delete_round_trip() {
     let writer = key(0x02);
-    let namespace = auth::namespace_for(&writer);
-    let (_, app) = app(KeposPolicy::new([writer.clone()], [], false));
+    let namespace = "neil".to_owned();
+    let (_, app) = app(KeposPolicy::new([writer_binding("neil", vec![writer.clone()])]).unwrap());
     let auth_headers = headers(&writer, &namespace);
 
     let (status, body, _) = request(
@@ -185,8 +184,8 @@ async fn put_read_scan_list_export_delete_round_trip() {
 #[tokio::test]
 async fn replace_increments_version_and_conflicts_on_stale_keys() {
     let writer = key(0x03);
-    let namespace = auth::namespace_for(&writer);
-    let (_, app) = app(KeposPolicy::new([writer.clone()], [], false));
+    let namespace = "neil".to_owned();
+    let (_, app) = app(KeposPolicy::new([writer_binding("neil", vec![writer.clone()])]).unwrap());
     let auth_headers = headers(&writer, &namespace);
 
     let (_, body, _) = request(
@@ -225,8 +224,8 @@ async fn replace_increments_version_and_conflicts_on_stale_keys() {
 #[tokio::test]
 async fn namespace_assertion_mismatch_is_forbidden() {
     let writer = key(0x04);
-    let (_, app) = app(KeposPolicy::new([writer.clone()], [], false));
-    let mut wrong = headers(&writer, &auth::namespace_for(&writer));
+    let (_, app) = app(KeposPolicy::new([writer_binding("neil", vec![writer.clone()])]).unwrap());
+    let mut wrong = headers(&writer, "neil");
     wrong.insert("x-tact-memory-namespace", "alice".parse().unwrap());
     let (status, body, _) = request(&app, "GET", "/v1/session", wrong, None).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
@@ -237,8 +236,8 @@ async fn namespace_assertion_mismatch_is_forbidden() {
 async fn missing_or_unknown_authorization_is_unauthorized() {
     let writer = key(0x05);
     let stranger = key(0x06);
-    let namespace = auth::namespace_for(&writer);
-    let (_, app) = app(KeposPolicy::new([writer.clone()], [], false));
+    let namespace = "neil".to_owned();
+    let (_, app) = app(KeposPolicy::new([writer_binding("neil", vec![writer.clone()])]).unwrap());
 
     let (status, body, response_headers) =
         request(&app, "GET", "/v1/session", HeaderMap::new(), None).await;
@@ -253,7 +252,7 @@ async fn missing_or_unknown_authorization_is_unauthorized() {
         &app,
         "GET",
         "/v1/session",
-        headers(&stranger, &auth::namespace_for(&stranger)),
+        headers(&stranger, "stranger"),
         None,
     )
     .await;
@@ -270,8 +269,14 @@ async fn missing_or_unknown_authorization_is_unauthorized() {
 #[tokio::test]
 async fn readonly_devices_cannot_mutate() {
     let observer = key(0x07);
-    let namespace = auth::namespace_for(&observer);
-    let (_, app) = app(KeposPolicy::new([], [observer.clone()], false));
+    let namespace = "observer".to_owned();
+    let binding = Binding::new(
+        "observer".to_owned(),
+        RemoteRole::Reader,
+        vec![observer.clone()],
+    )
+    .unwrap();
+    let (_, app) = app(KeposPolicy::new([binding]).unwrap());
     let auth_headers = headers(&observer, &namespace);
 
     let (status, body, _) = request(&app, "GET", "/v1/session", auth_headers.clone(), None).await;
@@ -293,8 +298,8 @@ async fn readonly_devices_cannot_mutate() {
 #[tokio::test]
 async fn bounds_and_shape_errors_map_to_stable_codes() {
     let writer = key(0x08);
-    let namespace = auth::namespace_for(&writer);
-    let (_, app) = app(KeposPolicy::new([writer.clone()], [], false));
+    let namespace = "neil".to_owned();
+    let (_, app) = app(KeposPolicy::new([writer_binding("neil", vec![writer.clone()])]).unwrap());
     let auth_headers = headers(&writer, &namespace);
 
     let long_query = "x".repeat(513);
@@ -348,9 +353,13 @@ async fn bounds_and_shape_errors_map_to_stable_codes() {
 async fn scan_spans_all_visible_namespaces() {
     let alice = key(0x09);
     let bob = key(0x0a);
-    let alice_ns = auth::namespace_for(&alice);
-    let bob_ns = auth::namespace_for(&bob);
-    let (_, app) = app(KeposPolicy::new([alice.clone(), bob.clone()], [], false));
+    let alice_ns = "alice".to_owned();
+    let bob_ns = "bob".to_owned();
+    let (_, app) = app(KeposPolicy::new([
+        writer_binding("alice", vec![alice.clone()]),
+        writer_binding("bob", vec![bob.clone()]),
+    ])
+    .unwrap());
 
     for (pk, ns, content) in [
         (&alice, &alice_ns, "alice shared fact"),
@@ -389,8 +398,8 @@ async fn scan_spans_all_visible_namespaces() {
 #[tokio::test]
 async fn sync_reconciles_a_namespace_snapshot() {
     let writer = key(0x0b);
-    let namespace = auth::namespace_for(&writer);
-    let (_, app) = app(KeposPolicy::new([writer.clone()], [], false));
+    let namespace = "neil".to_owned();
+    let (_, app) = app(KeposPolicy::new([writer_binding("neil", vec![writer.clone()])]).unwrap());
     let auth_headers = headers(&writer, &namespace);
 
     let snapshot = json!({

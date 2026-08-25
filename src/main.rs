@@ -3,9 +3,10 @@
 //! The service speaks the Tact remote-memory protocol (routes under `/v1/`) and is meant to
 //! sit behind a Kepos publisher's `kind = "http"` service. Kepos strips caller-supplied
 //! `Authorization` fields and injects `Authorization: Kepos <subscriber-public-key>`; this
-//! server derives each device's Tact namespace from that identity and applies the configured
-//! role policy. Never expose the listener outside the private Kepos publisher ingress — the
-//! header can be forged by anything that reaches the target directly.
+//! server resolves each device to its bound Tact namespace (one person's several devices share
+//! one namespace) and applies the configured role. Never expose the listener outside the
+//! private Kepos publisher ingress — the header can be forged by anything that reaches the
+//! target directly.
 
 use std::net::SocketAddr;
 
@@ -29,16 +30,16 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     let settings = config::Settings::resolve(&args)?;
     let policy = settings.policy()?;
-    if settings.allow.is_empty() && settings.readonly.is_empty() && !settings.allow_all {
+    if !settings.has_devices() {
         eprintln!(
-            "warning: no Kepos devices are authorized; every request will return 401.              Configure --allow/--readonly or --allow-all."
+            "warning: no Kepos devices are bound; every request will return 401. \
+             Configure --binding or a config file with [[auth.bindings]]."
         );
     }
     info!(
         bind = %settings.bind,
         db = %settings.db.display(),
-        allowed = settings.allow.len() + settings.readonly.len(),
-        allow_all = settings.allow_all,
+        devices = settings.bindings.iter().map(|b| b.keys.len()).sum::<usize>(),
         "starting Kepos Tact memory service"
     );
 

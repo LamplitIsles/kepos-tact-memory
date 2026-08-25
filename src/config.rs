@@ -1,12 +1,13 @@
-//! Runtime settings: server binding, SQLite path, and the Kepos role policy.
+//! Runtime settings: server binding, SQLite path, and the device→namespace policy.
 
 use std::{net::SocketAddr, path::PathBuf};
 
 use clap::Parser;
 use serde::Deserialize;
+use tact_memory::RemoteRole;
 use thiserror::Error;
 
-use crate::auth::{KeposPolicy, PUBLIC_KEY_HEX_LEN, is_public_key};
+use crate::auth::{Binding, KeposPolicy, PolicyError};
 
 const DEFAULT_BIND: &str = "127.0.0.1:8787";
 const DEFAULT_DB: &str = "memory/kepos-tact-memory.sqlite3";
@@ -23,20 +24,11 @@ pub struct Args {
     #[arg(long, default_value = DEFAULT_DB)]
     pub db: PathBuf,
 
-    /// Kepos subscriber public keys permitted to use the service (repeatable).
-    #[arg(long)]
-    pub allow: Vec<String>,
+    /// Bind one namespace to Kepos keys: NAMESPACE:KEY[,KEY...] (repeatable, writer role).
+    #[arg(long, value_name = "NAMESPACE:KEY[,KEY...]")]
+    pub binding: Vec<String>,
 
-    /// Kepos subscriber public keys restricted to read-only (repeatable).
-    #[arg(long)]
-    pub readonly: Vec<String>,
-
-    /// Authorize every valid Kepos key, trusting the Kepos publisher allowlist as the
-    /// authorization boundary.
-    #[arg(long)]
-    pub allow_all: bool,
-
-    /// Optional TOML configuration file supplying [server] and [auth] defaults.
+    /// Optional TOML configuration file supplying [server] and [auth.bindings].
     #[arg(long)]
     pub config: Option<PathBuf>,
 }
@@ -61,9 +53,25 @@ pub struct FileServer {
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FileAuth {
-    pub allow_all: Option<bool>,
-    pub allow: Option<Vec<String>>,
-    pub readonly: Option<Vec<String>>,
+    /// Device→namespace bindings; see `config.example.toml`.
+    #[serde(default)]
+    pub bindings: Vec<FileBinding>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileBinding {
+    /// Human-readable namespace shared by the bound devices.
+    pub namespace: String,
+    /// `writer` (default) or `reader`.
+    #[serde(default = "default_role")]
+    pub role: RemoteRole,
+    /// Kepos subscriber public keys (64 ASCII hex characters).
+    pub keys: Vec<String>,
+}
+
+const fn default_role() -> RemoteRole {
+    RemoteRole::Writer
 }
 
 /// Effective runtime settings after merging the configuration file with command-line flags.
@@ -71,9 +79,7 @@ pub struct FileAuth {
 pub struct Settings {
     pub bind: SocketAddr,
     pub db: PathBuf,
-    pub allow_all: bool,
-    pub allow: Vec<String>,
-    pub readonly: Vec<String>,
+    pub bindings: Vec<Binding>,
 }
 
 impl Settings {
@@ -105,48 +111,53 @@ impl Settings {
             }
             _ => args.db.clone(),
         };
-        let allow_all =
-            args.allow_all || file_auth.and_then(|auth| auth.allow_all).unwrap_or(false);
-        let mut allow = args.allow.clone();
-        if allow.is_empty() {
-            allow = file_auth
-                .and_then(|auth| auth.allow.clone())
-                .unwrap_or_default();
-        }
-        let mut readonly = args.readonly.clone();
-        if readonly.is_empty() {
-            readonly = file_auth
-                .and_then(|auth| auth.readonly.clone())
-                .unwrap_or_default();
-        }
-        Ok(Self {
-            bind,
-            db,
-            allow_all,
-            allow,
-            readonly,
-        })
-    }
 
-    /// Builds the Kepos role policy, validating every configured public key.
-    pub fn policy(&self) -> Result<KeposPolicy, ConfigError> {
-        for key in self.allow.iter().chain(self.readonly.iter()) {
-            if !is_public_key(key) {
-                return Err(ConfigError::InvalidPublicKey(key.clone()));
+        let mut bindings = Vec::new();
+        if let Some(auth) = file_auth {
+            for binding in &auth.bindings {
+                bindings.push(Binding::new(
+                    binding.namespace.clone(),
+                    binding.role,
+                    binding.keys.clone(),
+                )?);
             }
         }
-        let allow: Vec<String> = self
-            .allow
-            .iter()
-            .map(|key| key.to_ascii_lowercase())
-            .collect();
-        let readonly: Vec<String> = self
-            .readonly
-            .iter()
-            .map(|key| key.to_ascii_lowercase())
-            .collect();
-        Ok(KeposPolicy::new(allow, readonly, self.allow_all))
+        for raw in &args.binding {
+            bindings.push(parse_cli_binding(raw)?);
+        }
+        Ok(Self { bind, db, bindings })
     }
+
+    /// Builds the Kepos device→namespace policy, rejecting ambiguous or invalid bindings.
+    pub fn policy(&self) -> Result<KeposPolicy, PolicyError> {
+        KeposPolicy::new(self.bindings.clone())
+    }
+
+    /// Returns whether any device is authorized.
+    pub fn has_devices(&self) -> bool {
+        self.bindings.iter().any(|binding| !binding.keys.is_empty())
+    }
+}
+
+/// Parses `NAMESPACE:KEY[,KEY...]` into a writer binding.
+fn parse_cli_binding(raw: &str) -> Result<Binding, ConfigError> {
+    let (namespace, keys) = raw
+        .split_once(':')
+        .ok_or_else(|| ConfigError::Binding(raw.to_owned()))?;
+    if namespace.is_empty() || keys.is_empty() {
+        return Err(ConfigError::Binding(raw.to_owned()));
+    }
+    let keys = keys
+        .split(',')
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
+        .map(str::to_owned)
+        .collect();
+    Ok(Binding::new(
+        namespace.to_owned(),
+        RemoteRole::Writer,
+        keys,
+    )?)
 }
 
 /// Failure while resolving runtime settings.
@@ -158,14 +169,17 @@ pub enum ConfigError {
     Parse(PathBuf, toml::de::Error),
     #[error("invalid bind address {0:?}: {1}")]
     Bind(String, std::net::AddrParseError),
-    #[error("invalid Kepos public key {0:?}: expected {PUBLIC_KEY_HEX_LEN} ASCII hex characters")]
-    InvalidPublicKey(String),
+    #[error("invalid --binding {0:?}: expected NAMESPACE:KEY[,KEY...]")]
+    Binding(String),
+    #[error(transparent)]
+    Policy(#[from] PolicyError),
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use clap::Parser;
+    use tact_memory::server::protocol::is_valid_namespace;
 
     fn key(byte: u8) -> String {
         format!("{byte:02x}").repeat(32)
@@ -177,23 +191,49 @@ mod tests {
         let settings = Settings::resolve(&args).unwrap();
         assert_eq!(settings.bind.to_string(), DEFAULT_BIND);
         assert_eq!(settings.db, PathBuf::from(DEFAULT_DB));
-        assert!(!settings.allow_all);
+        assert!(!settings.has_devices());
     }
 
     #[test]
-    fn file_values_apply_when_flags_are_defaulted() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.toml");
+    fn cli_binding_binds_devices_to_a_namespace() {
         let k1 = key(0x01);
         let k2 = key(0x02);
+        let args = Args::parse_from([
+            "kepos-tact-memory",
+            "--binding",
+            &format!("neil:{k1},{k2}"),
+            "--binding",
+            &format!("bob:{}", key(0x03)),
+        ]);
+        let settings = Settings::resolve(&args).unwrap();
+        let policy = settings.policy().unwrap();
+        assert_eq!(policy.resolve(&k1), Some(("neil", RemoteRole::Writer)));
+        assert_eq!(policy.resolve(&k2), Some(("neil", RemoteRole::Writer)));
+        assert_eq!(
+            policy.resolve(&key(0x03)),
+            Some(("bob", RemoteRole::Writer))
+        );
+    }
+
+    #[test]
+    fn file_bindings_supply_namespaces_and_roles() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let k1 = key(0x0a);
+        let k2 = key(0x0b);
         let toml_text = format!(
             r#"[server]
 bind = "127.0.0.1:9999"
 db = "custom.sqlite3"
-[auth]
-allow_all = true
-allow = ["{k1}"]
-readonly = ["{k2}"]
+
+[[auth.bindings]]
+namespace = "neil"
+keys = ["{k1}"]
+
+[[auth.bindings]]
+namespace = "bob"
+role = "reader"
+keys = ["{k2}"]
 "#
         );
         std::fs::write(&path, toml_text).unwrap();
@@ -201,9 +241,26 @@ readonly = ["{k2}"]
         let settings = Settings::resolve(&args).unwrap();
         assert_eq!(settings.bind.to_string(), "127.0.0.1:9999");
         assert_eq!(settings.db, PathBuf::from("custom.sqlite3"));
-        assert!(settings.allow_all);
-        assert_eq!(settings.allow, vec![k1]);
-        assert_eq!(settings.readonly, vec![k2]);
+        let policy = settings.policy().unwrap();
+        assert_eq!(policy.resolve(&k1), Some(("neil", RemoteRole::Writer)));
+        assert_eq!(policy.resolve(&k2), Some(("bob", RemoteRole::Reader)));
+    }
+
+    #[test]
+    fn duplicate_device_across_bindings_is_rejected() {
+        let k = key(0x0c);
+        let args = Args::parse_from([
+            "kepos-tact-memory",
+            "--binding",
+            &format!("neil:{k}"),
+            "--binding",
+            &format!("bob:{k}"),
+        ]);
+        let settings = Settings::resolve(&args).unwrap();
+        assert!(matches!(
+            settings.policy(),
+            Err(PolicyError::DuplicateKey(_))
+        ));
     }
 
     #[test]
@@ -214,8 +271,6 @@ readonly = ["{k2}"]
             &path,
             r#"[server]
 bind = "127.0.0.1:9999"
-[auth]
-allow = ["a"]
 "#,
         )
         .unwrap();
@@ -231,12 +286,13 @@ allow = ["a"]
     }
 
     #[test]
-    fn policy_rejects_malformed_keys() {
-        let args = Args::parse_from(["kepos-tact-memory", "--allow", "not-a-key"]);
-        let settings = Settings::resolve(&args).unwrap();
+    fn bindings_must_be_protocol_namespaces() {
+        let k = key(0x0d);
+        let error = parse_cli_binding(&format!("bad namespace:{k}"));
         assert!(matches!(
-            settings.policy(),
-            Err(ConfigError::InvalidPublicKey(_))
+            error,
+            Err(ConfigError::Policy(PolicyError::InvalidNamespace(_)))
         ));
+        assert!(is_valid_namespace("neil"));
     }
 }

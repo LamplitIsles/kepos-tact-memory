@@ -7,13 +7,18 @@
 bind = "127.0.0.1:8787"
 db = "memory/kepos-tact-memory.sqlite3"
 
-[auth]
-# Authorize every valid Kepos key, trusting the Kepos publisher allowlist as the
-# authorization boundary. Set false to require explicit allow/readonly entries.
-allow_all = false
+# Device→namespace bindings. A namespace is a person or team; one person's several
+# devices share one namespace, and each device stays bound to exactly one namespace.
+# Devices are Kepos subscriber public keys (64 ASCII hex characters).
+#
+# [[auth.bindings]]
+# namespace = "neil"
+# keys = ["<pubkey1>", "<pubkey2>"]
 
-# Kepos subscriber public keys permitted to use the service.
-# allow = ["<64-hex-subscriber-public-key>"]
-
-# Kepos subscriber public keys restricted to scan/read/list/export (observers).
-# readonly = ["<64-hex-subscriber-public-key>"]
+# A binding defaults to role "writer"; use "reader" for observers that may scan,
+# read, list, and export but cannot mutate.
+#
+# [[auth.bindings]]
+# namespace = "bob"
+# role = "reader"
+# keys = ["<pubkey3>"]

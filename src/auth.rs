@@ -8,35 +8,84 @@
 //! ```
 //!
 //! `<subscriber-public-key>` is the authenticated subscriber's canonical lowercase
-//! 64-hex-character public key — a device identity, not a person or a secret. This module
-//! parses that header, maps the device identity to a stable Tact memory namespace, and applies
-//! the configured role policy. The header is trustworthy only at the intended private publisher
-//! ingress: anything that can reach the target without passing through Kepos can forge it.
+//! 64-hex-character public key — a device identity, not a person or a secret. The operator
+//! binds devices to human-readable Tact namespaces; one person's several devices share one
+//! namespace:
+//!
+//! ```toml
+//! [[auth.bindings]]
+//! namespace = "neil"
+//! keys = ["<pubkey1>", "<pubkey2>"]
+//!
+//! [[auth.bindings]]
+//! namespace = "bob"
+//! role = "reader"
+//! keys = ["<pubkey3>"]
+//! ```
+//!
+//! The header is trustworthy only at the intended private publisher ingress: anything that
+//! can reach the target without passing through Kepos can forge it.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 
-use tact_memory::RemoteRole;
+use tact_memory::{RemoteRole, server::protocol::is_valid_namespace};
+use thiserror::Error;
 
 /// Authorization scheme injected by the Kepos HTTP publisher adapter.
 pub const AUTH_SCHEME: &str = "Kepos";
 /// Length in ASCII hex characters of a Kepos subscriber public key.
 pub const PUBLIC_KEY_HEX_LEN: usize = 64;
-/// Prefix of the deterministic namespace derived from a Kepos identity.
-pub const NAMESPACE_PREFIX: &str = "kepos-";
 
-/// Failure while reading the Kepos authorization header.
+/// One namespace bound to one or more Kepos devices.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Binding {
+    /// Human-readable Tact namespace shared by the bound devices.
+    pub namespace: String,
+    /// Role granted to every device in this binding.
+    pub role: RemoteRole,
+    /// Kepos subscriber public keys (64 ASCII hex characters).
+    pub keys: Vec<String>,
+}
+
+impl Binding {
+    /// Validates a namespace and its public keys.
+    pub fn new(
+        namespace: String,
+        role: RemoteRole,
+        keys: Vec<String>,
+    ) -> Result<Self, PolicyError> {
+        if !is_valid_namespace(&namespace) {
+            return Err(PolicyError::InvalidNamespace(namespace));
+        }
+        for key in &keys {
+            if !is_public_key(key) {
+                return Err(PolicyError::InvalidPublicKey(key.clone()));
+            }
+        }
+        Ok(Self {
+            namespace,
+            role,
+            keys: keys
+                .into_iter()
+                .map(|key| key.to_ascii_lowercase())
+                .collect(),
+        })
+    }
+}
+
+/// Failure while parsing the Kepos authorization header.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AuthError {
     /// The header is not a valid `Kepos <64-hex>` value.
     Malformed,
 }
 
-/// An authenticated Kepos device and its derived Tact memory principal.
+/// An authenticated Kepos device and its resolved Tact memory principal.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KeposPrincipal {
     /// Canonical lowercase 64-hex subscriber public key.
     pub public_key: String,
-    /// Deterministic namespace bound to this device: `kepos-<public_key>`.
+    /// Namespace bound to this device by the configured policy.
     pub namespace: String,
     /// Role authorized for this device by the configured policy.
     pub role: RemoteRole,
@@ -56,54 +105,57 @@ pub fn parse_authorization(value: &str) -> Result<String, AuthError> {
     Ok(token.to_ascii_lowercase())
 }
 
-/// Returns the stable Tact memory namespace for a normalized public key.
-///
-/// The result satisfies the protocol namespace grammar (at most 128 ASCII alphanumerics,
-/// periods, hyphens, or underscores), so it can travel in the `x-tact-memory-namespace`
-/// assertion header and in returned memory keys.
-pub fn namespace_for(public_key: &str) -> String {
-    format!("{NAMESPACE_PREFIX}{public_key}")
+/// Failure while assembling the device→namespace policy.
+#[derive(Debug, Error)]
+pub enum PolicyError {
+    /// A namespace violates the protocol grammar.
+    #[error("invalid memory namespace {0:?}")]
+    InvalidNamespace(String),
+    /// A key is not 64 ASCII hex characters.
+    #[error("invalid Kepos public key {0:?}: expected {PUBLIC_KEY_HEX_LEN} ASCII hex characters")]
+    InvalidPublicKey(String),
+    /// The same device appears in more than one binding.
+    #[error("Kepos public key {0:?} is bound to more than one namespace")]
+    DuplicateKey(String),
+    /// No bindings were configured.
+    #[error("no Kepos device bindings are configured")]
+    NoBindings,
 }
 
-/// Role policy applied to Kepos device identities.
+/// Device→namespace resolution table.
 #[derive(Clone, Debug, Default)]
 pub struct KeposPolicy {
-    allow: HashSet<String>,
-    readonly: HashSet<String>,
-    allow_all: bool,
+    devices: HashMap<String, (String, RemoteRole)>,
 }
 
 impl KeposPolicy {
-    /// Builds a policy from normalized public keys.
+    /// Builds the resolution table from validated bindings.
     ///
-    /// `readonly` devices are authorized as observers even when omitted from `allow`;
-    /// `allow_all` authorizes every valid Kepos key, trusting the Kepos publisher allowlist
-    /// as the authorization boundary.
-    pub fn new(
-        allow: impl IntoIterator<Item = String>,
-        readonly: impl IntoIterator<Item = String>,
-        allow_all: bool,
-    ) -> Self {
-        Self {
-            allow: allow.into_iter().collect(),
-            readonly: readonly.into_iter().collect(),
-            allow_all,
+    /// Every key must appear in exactly one binding. Multiple keys may share a namespace, so
+    /// one person's devices resolve to the same Tact memory namespace.
+    pub fn new(bindings: impl IntoIterator<Item = Binding>) -> Result<Self, PolicyError> {
+        let mut devices = HashMap::new();
+        for binding in bindings {
+            for key in binding.keys {
+                if devices
+                    .insert(key.clone(), (binding.namespace.clone(), binding.role))
+                    .is_some()
+                {
+                    return Err(PolicyError::DuplicateKey(key));
+                }
+            }
         }
+        if devices.is_empty() {
+            return Err(PolicyError::NoBindings);
+        }
+        Ok(Self { devices })
     }
 
-    /// Authorizes a normalized public key, returning its role or `None` when the device is
-    /// unknown and not covered by `allow_all`.
-    pub fn authorize(&self, public_key: &str) -> Option<RemoteRole> {
-        let allowed =
-            self.allow_all || self.allow.contains(public_key) || self.readonly.contains(public_key);
-        if !allowed {
-            return None;
-        }
-        if self.readonly.contains(public_key) {
-            Some(RemoteRole::Reader)
-        } else {
-            Some(RemoteRole::Writer)
-        }
+    /// Resolves a normalized public key to its namespace and role.
+    pub fn resolve(&self, public_key: &str) -> Option<(&str, RemoteRole)> {
+        self.devices
+            .get(public_key)
+            .map(|(namespace, role)| (namespace.as_str(), *role))
     }
 }
 
@@ -113,6 +165,10 @@ mod tests {
 
     fn key(byte: u8) -> String {
         format!("{byte:02x}").repeat(32)
+    }
+
+    fn binding(namespace: &str, role: RemoteRole, keys: Vec<String>) -> Binding {
+        Binding::new(namespace.to_owned(), role, keys).unwrap()
     }
 
     #[test]
@@ -141,30 +197,81 @@ mod tests {
     }
 
     #[test]
-    fn derives_a_protocol_valid_namespace() {
-        let key = key(0x11);
-        let namespace = namespace_for(&key);
-        assert_eq!(namespace, format!("{NAMESPACE_PREFIX}{key}"));
-        assert!(tact_memory::server::protocol::is_valid_namespace(
-            &namespace
-        ));
-        assert!(namespace.len() <= tact_memory::server::protocol::MAX_NAMESPACE_BYTES);
+    fn multiple_devices_share_one_namespace() {
+        let device_one = key(0x01);
+        let device_two = key(0x02);
+        let policy = KeposPolicy::new([binding(
+            "neil",
+            RemoteRole::Writer,
+            vec![device_one.clone(), device_two.clone()],
+        )])
+        .unwrap();
+        assert_eq!(
+            policy.resolve(&device_one),
+            Some(("neil", RemoteRole::Writer))
+        );
+        assert_eq!(
+            policy.resolve(&device_two),
+            Some(("neil", RemoteRole::Writer))
+        );
+        assert_eq!(policy.resolve(&key(0x03)), None);
+        // Resolution is case-normalized.
+        assert_eq!(
+            policy.resolve(&device_one.to_uppercase()),
+            Some(("neil", RemoteRole::Writer))
+        );
     }
 
     #[test]
-    fn policy_maps_roles() {
-        let writer = key(0xab);
-        let observer = key(0xac);
-        let stranger = key(0xad);
-        let policy = KeposPolicy::new([writer.clone()], [observer.clone()], false);
-        assert_eq!(policy.authorize(&writer), Some(RemoteRole::Writer));
-        assert_eq!(policy.authorize(&observer), Some(RemoteRole::Reader));
-        assert_eq!(policy.authorize(&stranger), None);
-        assert_eq!(policy.authorize(&writer.to_uppercase()), None);
+    fn distinct_namespaces_and_roles() {
+        let neil_device = key(0x11);
+        let bob_device = key(0x22);
+        let policy = KeposPolicy::new([
+            binding("neil", RemoteRole::Writer, vec![neil_device.clone()]),
+            binding("bob", RemoteRole::Reader, vec![bob_device.clone()]),
+        ])
+        .unwrap();
+        assert_eq!(
+            policy.resolve(&neil_device),
+            Some(("neil", RemoteRole::Writer))
+        );
+        assert_eq!(
+            policy.resolve(&bob_device),
+            Some(("bob", RemoteRole::Reader))
+        );
+    }
 
-        let open = KeposPolicy::new([], [], true);
-        assert_eq!(open.authorize(&stranger), Some(RemoteRole::Writer));
-        let observed = KeposPolicy::new([], [observer.clone()], true);
-        assert_eq!(observed.authorize(&observer), Some(RemoteRole::Reader));
+    #[test]
+    fn a_device_cannot_be_bound_twice() {
+        let device = key(0x33);
+        let error = KeposPolicy::new([
+            binding("neil", RemoteRole::Writer, vec![device.clone()]),
+            binding("bob", RemoteRole::Writer, vec![device]),
+        ]);
+        assert!(matches!(error, Err(PolicyError::DuplicateKey(_))));
+    }
+
+    #[test]
+    fn binding_validates_namespace_and_keys() {
+        assert!(matches!(
+            Binding::new(
+                "has spaces!".to_owned(),
+                RemoteRole::Writer,
+                vec![key(0x01)]
+            ),
+            Err(PolicyError::InvalidNamespace(_))
+        ));
+        assert!(matches!(
+            Binding::new(
+                "neil".to_owned(),
+                RemoteRole::Writer,
+                vec!["not-a-key".to_owned()]
+            ),
+            Err(PolicyError::InvalidPublicKey(_))
+        ));
+        assert!(matches!(
+            KeposPolicy::new(Vec::<Binding>::new()),
+            Err(PolicyError::NoBindings)
+        ));
     }
 }

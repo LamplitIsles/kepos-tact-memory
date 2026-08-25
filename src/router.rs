@@ -338,11 +338,10 @@ fn authenticate(state: &ServerState, headers: &HeaderMap) -> Result<KeposPrincip
         .ok_or_else(ApiError::unauthorized)?;
     let public_key =
         auth::parse_authorization(authorization).map_err(|_| ApiError::unauthorized())?;
-    let role = state
+    let (namespace, role) = state
         .policy
-        .authorize(&public_key)
+        .resolve(&public_key)
         .ok_or_else(ApiError::unauthorized)?;
-    let namespace = auth::namespace_for(&public_key);
     let asserted = headers
         .get(protocol::NAMESPACE_HEADER)
         .and_then(|value| value.to_str().ok())
@@ -352,7 +351,7 @@ fn authenticate(state: &ServerState, headers: &HeaderMap) -> Result<KeposPrincip
     }
     Ok(KeposPrincipal {
         public_key,
-        namespace,
+        namespace: namespace.to_owned(),
         role,
     })
 }

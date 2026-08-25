@@ -1,17 +1,18 @@
 # kepos-tact-memory
 
 Local SQLite remote memory for [Tact](https://github.com/clabby/tact), published as a
-[Kepos](https://github.com/LamplitIsles/kepos) HTTP service. Each Kepos device gets its own
-Tact memory namespace, derived from the subscriber identity Kepos injects into every request:
+[Kepos](https://github.com/LamplitIsles/kepos) HTTP service. The Kepos publisher with
+`kind = "http"` strips all caller-supplied `Authorization` fields and injects exactly one
+identity-bearing header:
 
 ```http
 Authorization: Kepos <subscriber-public-key>
 ```
 
-The Kepos publisher with `kind = "http"` strips all caller-supplied `Authorization` fields
-and replaces them with exactly that header. This server authenticates the device, maps its
-identity to the namespace `kepos-<subscriber-public-key>`, and applies the configured role
-policy. No bearer tokens exist on the server.
+This server authenticates the device and resolves it to a Tact memory namespace through a
+configured binding table. A namespace is a person or team; one person's several devices share
+one namespace, and each device stays bound to exactly one namespace. No bearer tokens exist
+on the server.
 
 The service speaks Tact's remote-memory protocol (v1) — the same routes, wire types, bounds,
 BM25 retrieval, optimistic concurrency, and error codes as the reference server — so an
@@ -32,9 +33,10 @@ Routes under `/v1/`:
 | `POST /v1/memories/sync` | writer | Atomically reconcile the device's namespace to a snapshot. |
 | `POST /v1/memories/export` | reader | Stable paginated snapshot in `(namespace, id)` order. |
 
-Requests authenticate with `Authorization: Kepos <64-hex>` and assert the derived namespace
+Requests authenticate with `Authorization: Kepos <64-hex>` and assert the bound namespace
 in `x-tact-memory-namespace`. A mismatched assertion is rejected with `403 namespace_mismatch`.
-Unknown devices get `401 unauthorized`; reader devices cannot mutate (`403 forbidden`).
+Devices absent from the binding table get `401 unauthorized`; reader bindings cannot mutate
+(`403 forbidden`).
 
 Storage is one SQLite file. Records are bounded per namespace: 1 KiB content, 512 records,
 256 KiB aggregate content, seven days of unread probation (a successful read graduates a
@@ -52,24 +54,36 @@ cargo build --release
 
 ```sh
 kepos-tact-memory \
+  --config config.toml
+
+# or, for a quick single-namespace setup:
+kepos-tact-memory \
   --bind 127.0.0.1:8787 \
   --db memory/kepos-tact-memory.sqlite3 \
-  --allow c5a2168e17a53b699ced7e3f3c8470afd7f91b97a1582076c9797c3e024311a2 \
-  --allow 0d88922a7b6de68ca5011398c846f60de49129bc0d9592e0437b580c41a7e625 \
-  --readonly fb9782436a1d150879f65ec7d4a2281376499011df9fc45830c5459a92540d32
+  --binding neil:c5a2168e17a53b699ced7e3f3c8470afd7f91b97a1582076c9797c3e024311a2,0d88922a7b6de68ca5011398c846f60de49129bc0d9592e0437b580c41a7e625
 ```
 
-The same settings can live in a TOML file (`--config config.toml`); flags override the file.
-See `config.example.toml`.
+Bindings define who owns which namespace. The TOML form (`--config config.toml`, see
+`config.example.toml`) supports roles and is the natural home for the table:
 
-- `--allow`: Kepos public keys permitted to use the service (writers by default).
-- `--readonly`: permitted keys restricted to `reader` (observers).
-- `--allow-all`: authorize every valid Kepos key. Use only when the Kepos publisher
-  allowlist is the authorization boundary and the listener is unreachable except through it.
+```toml
+[[auth.bindings]]
+namespace = "neil"
+keys = ["<pubkey1>", "<pubkey2>"]   # neil's laptop and desktop share one namespace
 
-With an empty policy every request returns `401`. The listener defaults to `127.0.0.1:8787`
-and should stay loopback-only: the `Authorization: Kepos ...` header is trustworthy only at
-the private publisher ingress — anything that can reach the target directly can forge it.
+[[auth.bindings]]
+namespace = "bob"
+role = "reader"                      # observers cannot mutate
+keys = ["<pubkey3>"]
+```
+
+- `--binding NAMESPACE:KEY[,KEY...]` (repeatable): quick CLI bindings with writer role.
+- A device may appear in at most one binding; a namespace may bind any number of devices.
+- With no bindings every request returns `401`.
+
+The listener defaults to `127.0.0.1:8787` and should stay loopback-only: the
+`Authorization: Kepos ...` header is trustworthy only at the private publisher ingress —
+anything that can reach the target directly can forge it.
 
 ## Publish via Kepos
 
@@ -90,8 +104,8 @@ forwarding to this server.
 
 ## Tact client configuration
 
-Each person uses their own namespace — the identity-derived `kepos-<their public key>`. Create
-a private config (mode `0600`):
+Each person uses the namespace they are bound to — `neil` in the example above. Create a
+private config (mode `0600`):
 
 ```toml
 [memory]
@@ -99,14 +113,14 @@ enabled = true
 
 [memory.remote]
 endpoint = "http://tact-memory.localhost:17480/"
-namespace = "kepos-c5a2168e17a53b699ced7e3f3c8470afd7f91b97a1582076c9797c3e024311a2"
+namespace = "neil"
 bearer_token = "placeholder-not-used-behind-kepos"
 workspace_roots = ["/absolute/path/to/team-project"]
 ```
 
 Tact requires a non-empty `bearer_token`, but Kepos discards it and injects the device
-identity; any placeholder works. The namespace must match the server-derived value — read it
-from `GET /v1/session`. Inside a configured workspace root Tact uses remote memory only; use
+identity; any placeholder works. The namespace must match the binding — read it from
+`GET /v1/session`. Inside a configured workspace root Tact uses remote memory only; use
 `tact memory push` / `tact memory pull` from any directory to transfer the local store.
 
 ## Verification
