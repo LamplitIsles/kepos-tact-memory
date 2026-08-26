@@ -1,0 +1,40 @@
+# kepos-tact-memory configuration
+#
+# Optional. Flags override these values. The database is created on first use with
+# mode-0700 parents, matching Tact's private local store conventions.
+
+[server]
+bind = "127.0.0.1:8787"
+db = "memory/kepos-tact-memory.sqlite3"
+
+# Device→namespace bindings. A namespace is a person or team; one person's several
+# devices share one namespace, and each device stays bound to exactly one namespace.
+# Devices are Kepos subscriber public keys (64 ASCII hex characters).
+#
+# [[auth.bindings]]
+# namespace = "neil"
+# keys = ["<pubkey1>", "<pubkey2>"]
+
+# A binding defaults to role "writer"; use "reader" for observers that may scan,
+# read, list, and export but cannot mutate.
+#
+# [[auth.bindings]]
+# namespace = "bob"
+# role = "reader"
+# keys = ["<pubkey3>"]
+
+# Loopback-only bearer credentials (optional). A same-host Tact client can authenticate
+# with "Authorization: Bearer <token>"; non-loopback sources always require the Kepos
+# header, so the bearer channel is never a network identity. Prefer "token_file" so the
+# secret lives in an unmanaged mode-0600 file instead of a managed configuration.
+#
+# [[auth.credentials]]
+# namespace = "neil"
+# token_file = "/home/neil/.local/state/kepos-tact-memory/loopback.token"
+#
+# An inline token is also accepted:
+#
+# [[auth.credentials]]
+# namespace = "bob"
+# role = "reader"
+# token = "a-long-random-token"
