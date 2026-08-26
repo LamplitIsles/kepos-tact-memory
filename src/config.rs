@@ -196,7 +196,7 @@ impl Settings {
 /// Upper bound on the raw bytes of a bearer token file.
 const MAX_TOKEN_FILE_BYTES: usize = 64 * 1024;
 
-/// Enforces that a bearer token file is a regular mode-0600 file.
+/// Enforces that a bearer token file is a regular owner-only file (e.g. mode 0600).
 #[cfg(unix)]
 fn check_token_file_mode(path: &PathBuf) -> Result<(), ConfigError> {
     use std::os::unix::fs::PermissionsExt;
@@ -285,7 +285,7 @@ pub enum ConfigError {
     CredentialField(String),
     #[error("could not read bearer token file {0}: {1}")]
     TokenFile(PathBuf, std::io::Error),
-    #[error("bearer token file {0} must be mode 0600 (actual mode {1:o})")]
+    #[error("bearer token file {0} must be owner-only, e.g. mode 0600 (actual mode {1:o})")]
     TokenFilePermissions(PathBuf, u32),
     #[error(transparent)]
     Policy(#[from] PolicyError),
@@ -553,6 +553,41 @@ token_file = "{tp}"
             settings.credential_table().unwrap().resolve("secret-token"),
             Some(("neil", RemoteRole::Writer))
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn any_owner_only_token_file_mode_is_accepted() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let token_path = dir.path().join("loopback.token");
+        std::fs::write(&token_path, "secret-token\n").unwrap();
+        let path = dir.path().join("config.toml");
+        let toml_text = format!(
+            r#"[[auth.bindings]]
+namespace = "neil"
+keys = ["{k}"]
+
+[[auth.credentials]]
+namespace = "neil"
+token_file = "{tp}"
+"#,
+            k = key(0x13),
+            tp = token_path.display()
+        );
+        std::fs::write(&path, toml_text).unwrap();
+        let args = Args::parse_from(["kepos-tact-memory", "--config", path.to_str().unwrap()]);
+
+        for mode in [0o400, 0o600, 0o700] {
+            std::fs::set_permissions(&token_path, std::fs::Permissions::from_mode(mode)).unwrap();
+            Settings::resolve(&args).unwrap();
+        }
+        // Group-readable (0440) is rejected even though owner retains full read.
+        std::fs::set_permissions(&token_path, std::fs::Permissions::from_mode(0o440)).unwrap();
+        assert!(matches!(
+            Settings::resolve(&args),
+            Err(ConfigError::TokenFilePermissions(_, 0o440))
+        ));
     }
 
     #[test]
