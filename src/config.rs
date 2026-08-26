@@ -131,6 +131,12 @@ impl Settings {
             _ => args.db.clone(),
         };
 
+        // The Kepos identity header is forgeable by any direct peer, so the listener must
+        // stay loopback-only; bearer credentials are also enforced loopback-only.
+        if !bind.ip().is_loopback() {
+            return Err(ConfigError::NonLoopbackBind(bind));
+        }
+
         let mut bindings = Vec::new();
         if let Some(auth) = file_auth {
             for binding in &auth.bindings {
@@ -190,8 +196,34 @@ impl Settings {
 /// Upper bound on the raw bytes of a bearer token file.
 const MAX_TOKEN_FILE_BYTES: usize = 64 * 1024;
 
+/// Enforces that a bearer token file is a regular mode-0600 file.
+#[cfg(unix)]
+fn check_token_file_mode(path: &PathBuf) -> Result<(), ConfigError> {
+    use std::os::unix::fs::PermissionsExt;
+    let metadata =
+        std::fs::metadata(path).map_err(|source| ConfigError::TokenFile(path.clone(), source))?;
+    if !metadata.is_file() {
+        return Err(ConfigError::TokenFile(
+            path.clone(),
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "token file is not a regular file"),
+        ));
+    }
+    let mode = metadata.permissions().mode() & 0o777;
+    if mode & 0o077 != 0 {
+        return Err(ConfigError::TokenFilePermissions(path.clone(), mode));
+    }
+    Ok(())
+}
+
+/// Mode checks do not apply off Unix.
+#[cfg(not(unix))]
+fn check_token_file_mode(_path: &PathBuf) -> Result<(), ConfigError> {
+    Ok(())
+}
+
 /// Reads the first non-empty line of a bearer token file.
 fn read_token_file(path: &PathBuf) -> Result<String, ConfigError> {
+    check_token_file_mode(path)?;
     let raw = std::fs::read_to_string(path)
         .map_err(|source| ConfigError::TokenFile(path.clone(), source))?;
     if raw.len() > MAX_TOKEN_FILE_BYTES {
@@ -245,12 +277,16 @@ pub enum ConfigError {
     Parse(PathBuf, toml::de::Error),
     #[error("invalid bind address {0:?}: {1}")]
     Bind(String, std::net::AddrParseError),
+    #[error("bind address {0} is not loopback: the Kepos header is forgeable by any direct peer, so the listener must stay on 127.0.0.1 or ::1")]
+    NonLoopbackBind(SocketAddr),
     #[error("invalid --binding {0:?}: expected NAMESPACE:KEY[,KEY...]")]
     Binding(String),
     #[error("credential for namespace {0:?} must set exactly one of token or token_file")]
     CredentialField(String),
     #[error("could not read bearer token file {0}: {1}")]
     TokenFile(PathBuf, std::io::Error),
+    #[error("bearer token file {0} must be mode 0600 (actual mode {1:o})")]
+    TokenFilePermissions(PathBuf, u32),
     #[error(transparent)]
     Policy(#[from] PolicyError),
 }
@@ -381,6 +417,11 @@ bind = "127.0.0.1:9999"
         let dir = tempfile::tempdir().unwrap();
         let token_path = dir.path().join("loopback.token");
         std::fs::write(&token_path, "file-token-1\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&token_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
         let path = dir.path().join("config.toml");
         let toml_text = format!(
             r#"[server]
@@ -442,10 +483,88 @@ namespace = "neil"
     }
 
     #[test]
+    fn non_loopback_bind_is_rejected_from_file_and_flags() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let toml_text = format!(
+            r#"[server]
+bind = "0.0.0.0:9999"
+
+[[auth.bindings]]
+namespace = "neil"
+keys = ["{k}"]
+"#,
+            k = key(0x11)
+        );
+        std::fs::write(&path, toml_text).unwrap();
+        let args = Args::parse_from(["kepos-tact-memory", "--config", path.to_str().unwrap()]);
+        assert!(matches!(
+            Settings::resolve(&args),
+            Err(ConfigError::NonLoopbackBind(_))
+        ));
+
+        let args = Args::parse_from(["kepos-tact-memory", "--bind", "0.0.0.0:9999"]);
+        assert!(matches!(
+            Settings::resolve(&args),
+            Err(ConfigError::NonLoopbackBind(_))
+        ));
+    }
+
+    #[test]
+    fn ipv6_loopback_bind_is_accepted() {
+        let args = Args::parse_from(["kepos-tact-memory", "--bind", "[::1]:8787"]);
+        let settings = Settings::resolve(&args).unwrap();
+        assert_eq!(settings.bind.to_string(), "[::1]:8787");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn token_file_mode_0600_is_enforced() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let token_path = dir.path().join("loopback.token");
+        std::fs::write(&token_path, "secret-token\n").unwrap();
+        std::fs::set_permissions(&token_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let path = dir.path().join("config.toml");
+        let toml_text = format!(
+            r#"[[auth.bindings]]
+namespace = "neil"
+keys = ["{k}"]
+
+[[auth.credentials]]
+namespace = "neil"
+token_file = "{tp}"
+"#,
+            k = key(0x12),
+            tp = token_path.display()
+        );
+        std::fs::write(&path, toml_text).unwrap();
+        let args = Args::parse_from(["kepos-tact-memory", "--config", path.to_str().unwrap()]);
+        assert!(matches!(
+            Settings::resolve(&args),
+            Err(ConfigError::TokenFilePermissions(_, 0o644))
+        ));
+
+        // 0600 is accepted and the token resolves.
+        std::fs::set_permissions(&token_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let settings = Settings::resolve(&args).unwrap();
+        assert_eq!(settings.credentials.len(), 1);
+        assert_eq!(
+            settings.credential_table().unwrap().resolve("secret-token"),
+            Some(("neil", RemoteRole::Writer))
+        );
+    }
+
+    #[test]
     fn oversized_token_file_is_rejected() {
         let dir = tempfile::tempdir().unwrap();
         let token_path = dir.path().join("loopback.token");
         std::fs::write(&token_path, "x".repeat(65 * 1024)).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&token_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
         let path = dir.path().join("config.toml");
         let toml_text = format!(
             r#"[[auth.bindings]]

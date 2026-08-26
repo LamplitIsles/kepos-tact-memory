@@ -11,8 +11,7 @@ Authorization: Kepos <subscriber-public-key>
 
 This server authenticates the device and resolves it to a Tact memory namespace through a
 configured binding table. A namespace is a person or team; one person's several devices share
-one namespace, and each device stays bound to exactly one namespace. No bearer tokens exist
-on the server.
+one namespace, and each device stays bound to exactly one namespace.
 
 The service speaks Tact's remote-memory protocol (v1) — the same routes, wire types, bounds,
 BM25 retrieval, optimistic concurrency, and error codes as the reference server — so an
