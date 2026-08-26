@@ -36,7 +36,9 @@ Routes under `/v1/`:
 Requests authenticate with `Authorization: Kepos <64-hex>` and assert the bound namespace
 in `x-tact-memory-namespace`. A mismatched assertion is rejected with `403 namespace_mismatch`.
 Devices absent from the binding table get `401 unauthorized`; reader bindings cannot mutate
-(`403 forbidden`).
+(`403 forbidden`). Same-host clients can instead authenticate with `Authorization:
+Bearer <token>` against `[[auth.credentials]]`; the bearer channel is enforced loopback-only
+(`127.0.0.1`/`::1`), so the Kepos header remains the only network identity.
 
 Storage is one SQLite file. Records are bounded per namespace: 1 KiB content, 512 records,
 256 KiB aggregate content, seven days of unread probation (a successful read graduates a
@@ -75,6 +77,10 @@ keys = ["<pubkey1>", "<pubkey2>"]   # neil's laptop and desktop share one namesp
 namespace = "bob"
 role = "reader"                      # observers cannot mutate
 keys = ["<pubkey3>"]
+
+[[auth.credentials]]                 # optional loopback-only bearer channel
+namespace = "neil"
+token_file = "/home/neil/.local/state/kepos-tact-memory/loopback.token"
 ```
 
 - `--binding NAMESPACE:KEY[,KEY...]` (repeatable): quick CLI bindings with writer role.

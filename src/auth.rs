@@ -25,9 +25,15 @@
 //!
 //! The header is trustworthy only at the intended private publisher ingress: anything that
 //! can reach the target without passing through Kepos can forge it.
+//!
+//! A second, optional channel authenticates same-host Tact clients. A loopback-only bearer
+//! credential (`Authorization: Bearer <token>`) resolves the token to a namespace and role
+//! from `[[auth.credentials]]`; non-loopback sources can never use the bearer channel, so
+//! the Kepos header remains the only network identity.
 
 use std::collections::HashMap;
 
+use sha2::{Digest, Sha256};
 use tact_memory::{RemoteRole, server::protocol::is_valid_namespace};
 use thiserror::Error;
 
@@ -35,6 +41,10 @@ use thiserror::Error;
 pub const AUTH_SCHEME: &str = "Kepos";
 /// Length in ASCII hex characters of a Kepos subscriber public key.
 pub const PUBLIC_KEY_HEX_LEN: usize = 64;
+/// Optional loopback-only bearer scheme for same-host Tact clients.
+pub const BEARER_SCHEME: &str = "Bearer";
+/// Upper bound on bearer token length, mirroring the reference server.
+const MAX_BEARER_TOKEN_BYTES: usize = 4096;
 
 /// One namespace bound to one or more Kepos devices.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -80,20 +90,44 @@ pub enum AuthError {
     Malformed,
 }
 
-/// An authenticated Kepos device and its resolved Tact memory principal.
+/// How a request principal was authenticated.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AuthSource {
+    /// `Authorization: Kepos <subscriber-public-key>` injected by the publisher.
+    Kepos,
+    /// Loopback-only `Authorization: Bearer <token>` matching a configured credential.
+    Bearer,
+}
+
+/// An authenticated principal and its resolved Tact memory namespace.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct KeposPrincipal {
-    /// Canonical lowercase 64-hex subscriber public key.
-    pub public_key: String,
-    /// Namespace bound to this device by the configured policy.
+pub struct Principal {
+    /// Namespace bound to this principal by the configured policy.
     pub namespace: String,
-    /// Role authorized for this device by the configured policy.
+    /// Role authorized for this principal by the configured policy.
     pub role: RemoteRole,
+    /// Authentication path that produced this principal.
+    pub source: AuthSource,
 }
 
 /// Returns whether `value` is a Kepos public key (64 ASCII hex characters).
 pub fn is_public_key(value: &str) -> bool {
     value.len() == PUBLIC_KEY_HEX_LEN && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+/// Returns whether `value` is a valid bearer token (RFC 6750 token68 charset).
+pub fn is_bearer_token(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_BEARER_TOKEN_BYTES
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(byte, b'-' | b'.' | b'_' | b'~' | b'+' | b'/' | b'=')
+        })
+}
+
+/// Hashes a bearer token with SHA-256 so the runtime table retains no plaintext.
+pub fn hash_token(token: &str) -> [u8; 32] {
+    Sha256::digest(token.as_bytes()).into()
 }
 
 /// Parses an `Authorization` header value into a normalized lowercase public key.
@@ -117,6 +151,12 @@ pub enum PolicyError {
     /// The same device appears in more than one binding.
     #[error("Kepos public key {0:?} is bound to more than one namespace")]
     DuplicateKey(String),
+    /// A bearer token is empty, too large, or contains an unsupported byte.
+    #[error("bearer token is invalid")]
+    InvalidToken,
+    /// The same bearer token appears in more than one credential.
+    #[error("bearer token is used by more than one credential")]
+    DuplicateToken,
     /// No bindings were configured.
     #[error("no Kepos device bindings are configured")]
     NoBindings,
@@ -155,6 +195,70 @@ impl KeposPolicy {
     pub fn resolve(&self, public_key: &str) -> Option<(&str, RemoteRole)> {
         self.devices
             .get(public_key)
+            .map(|(namespace, role)| (namespace.as_str(), *role))
+    }
+}
+
+/// A loopback-only bearer credential bound to one namespace.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Credential {
+    /// Human-readable Tact namespace bound to this token.
+    pub namespace: String,
+    /// Role granted to this token.
+    pub role: RemoteRole,
+    /// Raw bearer token; hashed before retention by [CredentialTable].
+    pub token: String,
+}
+
+impl Credential {
+    /// Validates a namespace and bearer token.
+    pub fn new(
+        namespace: String,
+        role: RemoteRole,
+        token: String,
+    ) -> Result<Self, PolicyError> {
+        if !is_valid_namespace(&namespace) {
+            return Err(PolicyError::InvalidNamespace(namespace));
+        }
+        if !is_bearer_token(&token) {
+            return Err(PolicyError::InvalidToken);
+        }
+        Ok(Self {
+            namespace,
+            role,
+            token,
+        })
+    }
+}
+
+/// Token-hash→namespace resolution table for the loopback bearer channel.
+#[derive(Clone, Debug, Default)]
+pub struct CredentialTable {
+    tokens: HashMap<[u8; 32], (String, RemoteRole)>,
+}
+
+impl CredentialTable {
+    /// Builds the resolution table, rejecting duplicate bearer tokens.
+    pub fn new(
+        credentials: impl IntoIterator<Item = Credential>,
+    ) -> Result<Self, PolicyError> {
+        let mut tokens = HashMap::new();
+        for credential in credentials {
+            let hash = hash_token(&credential.token);
+            if tokens
+                .insert(hash, (credential.namespace, credential.role))
+                .is_some()
+            {
+                return Err(PolicyError::DuplicateToken);
+            }
+        }
+        Ok(Self { tokens })
+    }
+
+    /// Resolves a raw bearer token to its namespace and role.
+    pub fn resolve(&self, token: &str) -> Option<(&str, RemoteRole)> {
+        self.tokens
+            .get(&hash_token(token))
             .map(|(namespace, role)| (namespace.as_str(), *role))
     }
 }
@@ -272,6 +376,76 @@ mod tests {
         assert!(matches!(
             KeposPolicy::new(Vec::<Binding>::new()),
             Err(PolicyError::NoBindings)
+        ));
+    }
+
+    #[test]
+    fn bearer_token_grammar_caps_length() {
+        assert!(is_bearer_token(&"a".repeat(4096)));
+        assert!(!is_bearer_token(&"a".repeat(4097)));
+        assert!(!is_bearer_token(""));
+        assert!(!is_bearer_token("has space"));
+        assert!(!is_bearer_token("has\ttab"));
+    }
+
+    #[test]
+    fn credential_table_resolves_tokens_and_rejects_duplicates() {
+        let table = CredentialTable::new([
+            Credential::new(
+                "neil".to_owned(),
+                RemoteRole::Writer,
+                "token-a".to_owned(),
+            )
+            .unwrap(),
+            Credential::new("bob".to_owned(), RemoteRole::Reader, "token-b".to_owned())
+                .unwrap(),
+        ])
+        .unwrap();
+        assert_eq!(
+            table.resolve("token-a"),
+            Some(("neil", RemoteRole::Writer))
+        );
+        assert_eq!(
+            table.resolve("token-b"),
+            Some(("bob", RemoteRole::Reader))
+        );
+        assert_eq!(table.resolve("token-c"), None);
+        assert!(matches!(
+            CredentialTable::new([
+                Credential::new(
+                    "neil".to_owned(),
+                    RemoteRole::Writer,
+                    "same".to_owned()
+                )
+                .unwrap(),
+                Credential::new("bob".to_owned(), RemoteRole::Reader, "same".to_owned())
+                    .unwrap(),
+            ]),
+            Err(PolicyError::DuplicateToken)
+        ));
+    }
+
+    #[test]
+    fn credential_validates_namespace_and_token() {
+        assert!(matches!(
+            Credential::new(
+                "bad ns".to_owned(),
+                RemoteRole::Writer,
+                "tok".to_owned()
+            ),
+            Err(PolicyError::InvalidNamespace(_))
+        ));
+        assert!(matches!(
+            Credential::new("neil".to_owned(), RemoteRole::Writer, String::new()),
+            Err(PolicyError::InvalidToken)
+        ));
+        assert!(matches!(
+            Credential::new(
+                "neil".to_owned(),
+                RemoteRole::Writer,
+                "bad token!".to_owned()
+            ),
+            Err(PolicyError::InvalidToken)
         ));
     }
 }

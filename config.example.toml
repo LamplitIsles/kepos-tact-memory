@@ -22,3 +22,19 @@ db = "memory/kepos-tact-memory.sqlite3"
 # namespace = "bob"
 # role = "reader"
 # keys = ["<pubkey3>"]
+
+# Loopback-only bearer credentials (optional). A same-host Tact client can authenticate
+# with "Authorization: Bearer <token>"; non-loopback sources always require the Kepos
+# header, so the bearer channel is never a network identity. Prefer "token_file" so the
+# secret lives in an unmanaged mode-0600 file instead of a managed configuration.
+#
+# [[auth.credentials]]
+# namespace = "neil"
+# token_file = "/home/neil/.local/state/kepos-tact-memory/loopback.token"
+#
+# An inline token is also accepted:
+#
+# [[auth.credentials]]
+# namespace = "bob"
+# role = "reader"
+# token = "a-long-random-token"

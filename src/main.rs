@@ -4,9 +4,10 @@
 //! sit behind a Kepos publisher's `kind = "http"` service. Kepos strips caller-supplied
 //! `Authorization` fields and injects `Authorization: Kepos <subscriber-public-key>`; this
 //! server resolves each device to its bound Tact namespace (one person's several devices share
-//! one namespace) and applies the configured role. Never expose the listener outside the
-//! private Kepos publisher ingress — the header can be forged by anything that reaches the
-//! target directly.
+//! one namespace) and applies the configured role. Same-host clients may additionally
+//! authenticate with a loopback-only bearer token (`[[auth.credentials]]`); the Kepos header
+//! remains the only network identity. Never expose the listener outside the private Kepos
+//! publisher ingress — the header can be forged by anything that reaches the target directly.
 
 use std::net::SocketAddr;
 
@@ -30,27 +31,33 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     let settings = config::Settings::resolve(&args)?;
     let policy = settings.policy()?;
-    if !settings.has_devices() {
+    if !settings.has_devices() && settings.credentials.is_empty() {
         eprintln!(
-            "warning: no Kepos devices are bound; every request will return 401. \
-             Configure --binding or a config file with [[auth.bindings]]."
+            "warning: no Kepos devices are bound and no bearer credentials are configured; \
+             every request will return 401. Configure --binding or a config file with \
+             [[auth.bindings]] (and optionally [[auth.credentials]] for loopback clients)."
         );
     }
+    let credentials = settings.credential_table()?;
     info!(
         bind = %settings.bind,
         db = %settings.db.display(),
         devices = settings.bindings.iter().map(|b| b.keys.len()).sum::<usize>(),
+        credentials = settings.credentials.len(),
         "starting Kepos Tact memory service"
     );
 
-    let state = ServerState::new(settings.db.clone(), policy);
+    let state = ServerState::new(settings.db.clone(), policy, credentials);
     serve(settings.bind, state).await
 }
 
 async fn serve(bind: SocketAddr, state: ServerState) -> anyhow::Result<()> {
     let listener = TcpListener::bind(bind).await?;
     info!(%bind, "listening");
-    axum::serve(listener, router(state))
+    axum::serve(
+        listener,
+        router(state).into_make_service_with_connect_info::<SocketAddr>(),
+    )
         .with_graceful_shutdown(shutdown_signal())
         .await?;
     Ok(())

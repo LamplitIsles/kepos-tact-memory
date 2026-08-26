@@ -3,15 +3,16 @@
 //! `x-tact-memory-namespace` assertion. Response shapes are validated against the constraints
 //! the tact client enforces (see `crates/memory/src/store/remote/client.rs`).
 
-use std::collections::HashSet;
+use std::{collections::HashSet, net::SocketAddr};
 
 use axum::{
     Router,
     body::Body,
+    extract::ConnectInfo,
     http::{HeaderMap, Request, StatusCode, header},
 };
 use http_body_util::BodyExt;
-use kepos_tact_memory::auth::{Binding, KeposPolicy};
+use kepos_tact_memory::auth::{Binding, Credential, CredentialTable, KeposPolicy};
 use kepos_tact_memory::router::{ServerState, router};
 use serde_json::{Value, json};
 use tact_memory::RemoteRole;
@@ -26,9 +27,20 @@ fn writer_binding(namespace: &str, keys: Vec<String>) -> Binding {
 }
 
 fn app(policy: KeposPolicy) -> (tempfile::TempDir, Router) {
+    app_with_credentials(policy, CredentialTable::default())
+}
+
+fn app_with_credentials(
+    policy: KeposPolicy,
+    credentials: CredentialTable,
+) -> (tempfile::TempDir, Router) {
     let dir = tempfile::tempdir().unwrap();
-    let state = ServerState::new(dir.path().join("memory.sqlite3"), policy);
+    let state = ServerState::new(dir.path().join("memory.sqlite3"), policy, credentials);
     (dir, router(state))
+}
+
+fn credential(namespace: &str, role: RemoteRole, token: &str) -> Credential {
+    Credential::new(namespace.to_owned(), role, token.to_owned()).unwrap()
 }
 
 fn headers(public_key: &str, namespace: &str) -> HeaderMap {
@@ -48,7 +60,29 @@ async fn request(
     headers: HeaderMap,
     body: Option<Value>,
 ) -> (StatusCode, Value, HeaderMap) {
-    let mut builder = Request::builder().method(method).uri(path);
+    request_from(
+        app,
+        method,
+        path,
+        headers,
+        body,
+        "127.0.0.1:4242".parse().unwrap(),
+    )
+    .await
+}
+
+async fn request_from(
+    app: &Router,
+    method: &str,
+    path: &str,
+    headers: HeaderMap,
+    body: Option<Value>,
+    peer: SocketAddr,
+) -> (StatusCode, Value, HeaderMap) {
+    let mut builder = Request::builder()
+        .method(method)
+        .uri(path)
+        .extension(ConnectInfo(peer));
     for (name, value) in headers.iter() {
         builder = builder.header(name, value);
     }
@@ -245,7 +279,7 @@ async fn missing_or_unknown_authorization_is_unauthorized() {
     assert_eq!(body["code"], json!("unauthorized"));
     assert_eq!(
         response_headers.get(header::WWW_AUTHENTICATE).unwrap(),
-        "Kepos"
+        "Kepos, Bearer"
     );
 
     let (status, _, _) = request(
@@ -442,4 +476,90 @@ async fn sync_reconciles_a_namespace_snapshot() {
     )
     .await;
     assert!(body["memory"]["key"]["id"].as_i64().unwrap() > 1);
+}
+
+fn bearer_app() -> (tempfile::TempDir, Router) {
+    app_with_credentials(
+        KeposPolicy::new([writer_binding("neil", vec![key(0x01)])]).unwrap(),
+        CredentialTable::new([credential("neil", RemoteRole::Writer, "local-token-1")]).unwrap(),
+    )
+}
+
+fn bearer_headers(token: &str, namespace: &str) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::AUTHORIZATION,
+        format!("Bearer {token}").parse().unwrap(),
+    );
+    headers.insert("x-tact-memory-namespace", namespace.parse().unwrap());
+    headers
+}
+
+#[tokio::test]
+async fn bearer_credential_authenticates_loopback_session() {
+    let (_, app) = bearer_app();
+    let (status, body, _) = request(&app, "GET", "/v1/session", bearer_headers("local-token-1", "neil"), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["protocol_version"], json!(1));
+    assert_eq!(body["namespace"], json!("neil"));
+    assert_eq!(body["role"], json!("writer"));
+}
+
+#[tokio::test]
+async fn bearer_credentials_are_loopback_only() {
+    let (_, app) = bearer_app();
+    let (status, _, _) = request_from(
+        &app,
+        "GET",
+        "/v1/session",
+        bearer_headers("local-token-1", "neil"),
+        None,
+        "10.0.0.5:4242".parse().unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn bearer_rejects_unknown_token() {
+    let (_, app) = bearer_app();
+    let (status, _, _) = request(&app, "GET", "/v1/session", bearer_headers("wrong-token", "neil"), None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn bearer_rejects_oversized_token() {
+    let (_, app) = bearer_app();
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::AUTHORIZATION,
+        format!("Bearer {}", "a".repeat(4097)).parse().unwrap(),
+    );
+    headers.insert("x-tact-memory-namespace", "neil".parse().unwrap());
+    let (status, _, _) = request(&app, "GET", "/v1/session", headers, None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn bearer_rejects_namespace_mismatch() {
+    let (_, app) = bearer_app();
+    let (status, _, _) = request(&app, "GET", "/v1/session", bearer_headers("local-token-1", "bob"), None).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn kepos_path_works_from_any_source() {
+    let writer = key(0x01);
+    let (_, app) = app(KeposPolicy::new([writer_binding("neil", vec![writer.clone()])]).unwrap());
+    let (status, body, _) = request_from(
+        &app,
+        "GET",
+        "/v1/session",
+        headers(&writer, "neil"),
+        None,
+        "10.0.0.5:4242".parse().unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["namespace"], json!("neil"));
 }

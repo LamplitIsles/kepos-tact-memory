@@ -7,7 +7,7 @@ use serde::Deserialize;
 use tact_memory::RemoteRole;
 use thiserror::Error;
 
-use crate::auth::{Binding, KeposPolicy, PolicyError};
+use crate::auth::{Binding, Credential, CredentialTable, KeposPolicy, PolicyError};
 
 const DEFAULT_BIND: &str = "127.0.0.1:8787";
 const DEFAULT_DB: &str = "memory/kepos-tact-memory.sqlite3";
@@ -56,6 +56,9 @@ pub struct FileAuth {
     /// Device→namespace bindings; see `config.example.toml`.
     #[serde(default)]
     pub bindings: Vec<FileBinding>,
+    /// Loopback-only bearer credentials; see `config.example.toml`.
+    #[serde(default)]
+    pub credentials: Vec<FileCredential>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -70,6 +73,21 @@ pub struct FileBinding {
     pub keys: Vec<String>,
 }
 
+/// A loopback-only bearer credential declared in the TOML configuration file.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileCredential {
+    /// Human-readable namespace bound to this token.
+    pub namespace: String,
+    /// `writer` (default) or `reader`.
+    #[serde(default = "default_role")]
+    pub role: RemoteRole,
+    /// Inline bearer token (prefer `token_file` so secrets stay out of managed configs).
+    pub token: Option<String>,
+    /// Path to a mode-0600 file whose first non-empty line is the bearer token.
+    pub token_file: Option<PathBuf>,
+}
+
 const fn default_role() -> RemoteRole {
     RemoteRole::Writer
 }
@@ -80,6 +98,7 @@ pub struct Settings {
     pub bind: SocketAddr,
     pub db: PathBuf,
     pub bindings: Vec<Binding>,
+    pub credentials: Vec<Credential>,
 }
 
 impl Settings {
@@ -125,7 +144,31 @@ impl Settings {
         for raw in &args.binding {
             bindings.push(parse_cli_binding(raw)?);
         }
-        Ok(Self { bind, db, bindings })
+        let mut credentials = Vec::new();
+        if let Some(auth) = file_auth {
+            for credential in &auth.credentials {
+                let token = match (&credential.token, &credential.token_file) {
+                    (Some(token), None) => token.clone(),
+                    (None, Some(path)) => read_token_file(path)?,
+                    _ => {
+                        return Err(ConfigError::CredentialField(
+                            credential.namespace.clone(),
+                        ))
+                    }
+                };
+                credentials.push(Credential::new(
+                    credential.namespace.clone(),
+                    credential.role,
+                    token,
+                )?);
+            }
+        }
+        Ok(Self {
+            bind,
+            db,
+            bindings,
+            credentials,
+        })
     }
 
     /// Builds the Kepos device→namespace policy, rejecting ambiguous or invalid bindings.
@@ -137,6 +180,39 @@ impl Settings {
     pub fn has_devices(&self) -> bool {
         self.bindings.iter().any(|binding| !binding.keys.is_empty())
     }
+
+    /// Builds the loopback bearer-token table, rejecting duplicate tokens.
+    pub fn credential_table(&self) -> Result<CredentialTable, PolicyError> {
+        CredentialTable::new(self.credentials.clone())
+    }
+}
+
+/// Upper bound on the raw bytes of a bearer token file.
+const MAX_TOKEN_FILE_BYTES: usize = 64 * 1024;
+
+/// Reads the first non-empty line of a bearer token file.
+fn read_token_file(path: &PathBuf) -> Result<String, ConfigError> {
+    let raw = std::fs::read_to_string(path)
+        .map_err(|source| ConfigError::TokenFile(path.clone(), source))?;
+    if raw.len() > MAX_TOKEN_FILE_BYTES {
+        return Err(ConfigError::TokenFile(
+            path.clone(),
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "token file exceeds 64 KiB",
+            ),
+        ));
+    }
+    raw.lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            ConfigError::TokenFile(
+                path.clone(),
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "token file is empty"),
+            )
+        })
 }
 
 /// Parses `NAMESPACE:KEY[,KEY...]` into a writer binding.
@@ -171,6 +247,10 @@ pub enum ConfigError {
     Bind(String, std::net::AddrParseError),
     #[error("invalid --binding {0:?}: expected NAMESPACE:KEY[,KEY...]")]
     Binding(String),
+    #[error("credential for namespace {0:?} must set exactly one of token or token_file")]
+    CredentialField(String),
+    #[error("could not read bearer token file {0}: {1}")]
+    TokenFile(PathBuf, std::io::Error),
     #[error(transparent)]
     Policy(#[from] PolicyError),
 }
@@ -294,5 +374,96 @@ bind = "127.0.0.1:9999"
             Err(ConfigError::Policy(PolicyError::InvalidNamespace(_)))
         ));
         assert!(is_valid_namespace("neil"));
+    }
+
+    #[test]
+    fn file_credentials_parse_inline_tokens_and_token_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let token_path = dir.path().join("loopback.token");
+        std::fs::write(&token_path, "file-token-1\n").unwrap();
+        let path = dir.path().join("config.toml");
+        let toml_text = format!(
+            r#"[server]
+bind = "127.0.0.1:9999"
+
+[[auth.bindings]]
+namespace = "neil"
+keys = ["{k}"]
+
+[[auth.credentials]]
+namespace = "neil"
+token = "inline-token"
+
+[[auth.credentials]]
+namespace = "neil"
+role = "reader"
+token_file = "{tp}"
+"#,
+            k = key(0x0e),
+            tp = token_path.display()
+        );
+        std::fs::write(&path, toml_text).unwrap();
+        let args = Args::parse_from(["kepos-tact-memory", "--config", path.to_str().unwrap()]);
+        let settings = Settings::resolve(&args).unwrap();
+        let table = settings.credential_table().unwrap();
+        assert_eq!(
+            table.resolve("inline-token"),
+            Some(("neil", RemoteRole::Writer))
+        );
+        assert_eq!(
+            table.resolve("file-token-1"),
+            Some(("neil", RemoteRole::Reader))
+        );
+    }
+
+    #[test]
+    fn credential_requires_exactly_one_token_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            format!(
+                r#"[[auth.bindings]]
+namespace = "neil"
+keys = ["{k}"]
+
+[[auth.credentials]]
+namespace = "neil"
+"#,
+                k = key(0x0f)
+            ),
+        )
+        .unwrap();
+        let args = Args::parse_from(["kepos-tact-memory", "--config", path.to_str().unwrap()]);
+        assert!(matches!(
+            Settings::resolve(&args),
+            Err(ConfigError::CredentialField(_))
+        ));
+    }
+
+    #[test]
+    fn oversized_token_file_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let token_path = dir.path().join("loopback.token");
+        std::fs::write(&token_path, "x".repeat(65 * 1024)).unwrap();
+        let path = dir.path().join("config.toml");
+        let toml_text = format!(
+            r#"[[auth.bindings]]
+namespace = "neil"
+keys = ["{k}"]
+
+[[auth.credentials]]
+namespace = "neil"
+token_file = "{tp}"
+"#,
+            k = key(0x10),
+            tp = token_path.display()
+        );
+        std::fs::write(&path, toml_text).unwrap();
+        let args = Args::parse_from(["kepos-tact-memory", "--config", path.to_str().unwrap()]);
+        assert!(matches!(
+            Settings::resolve(&args),
+            Err(ConfigError::TokenFile(_, _))
+        ));
     }
 }

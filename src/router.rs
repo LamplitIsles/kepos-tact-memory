@@ -2,15 +2,18 @@
 //!
 //! Routes and validation mirror the reference `MemoryServer` wrapper, with one difference:
 //! authentication derives the principal from the Kepos publisher-injected `Authorization:
-//! Kepos <subscriber-public-key>` header instead of a bearer-token table. The authenticated
-//! namespace is passed to the store factory; a request can never select a namespace itself.
+//! Kepos <subscriber-public-key>` header instead of a bearer-token table. Same-host clients
+//! (loopback sources only) may instead authenticate with `Authorization: Bearer <token>`
+//! against `[[auth.credentials]]`; non-loopback sources can never use the bearer channel.
+//! The authenticated namespace is passed to the store factory; a request can never select a
+//! namespace itself.
 
-use std::{future::Future, path::PathBuf, sync::Arc, time::Duration};
+use std::{future::Future, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
 use axum::{
     Json, Router,
     body::Body,
-    extract::{DefaultBodyLimit, State, rejection::JsonRejection},
+    extract::{ConnectInfo, DefaultBodyLimit, State, rejection::JsonRejection},
     http::{HeaderMap, HeaderValue, Response, StatusCode, header},
     response::IntoResponse,
     routing::{get, post},
@@ -28,7 +31,7 @@ use tower::limit::ConcurrencyLimitLayer;
 use tracing::info;
 
 use crate::{
-    auth::{self, KeposPolicy, KeposPrincipal},
+    auth::{self, AuthSource, CredentialTable, KeposPolicy, Principal},
     store::SqliteMemoryStore,
 };
 
@@ -37,18 +40,24 @@ const MAX_JSON_BODY_BYTES: usize = 2 * 1024 * 1024;
 const MAX_IN_FLIGHT_REQUESTS: usize = 64;
 const STORE_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Shared router state: the database and the Kepos role policy.
+/// Shared router state: the database, the Kepos role policy, and loopback credentials.
 #[derive(Clone)]
 pub struct ServerState {
     db_path: Arc<PathBuf>,
     policy: Arc<KeposPolicy>,
+    credentials: Arc<CredentialTable>,
 }
 
 impl ServerState {
-    pub fn new(db_path: impl Into<PathBuf>, policy: KeposPolicy) -> Self {
+    pub fn new(
+        db_path: impl Into<PathBuf>,
+        policy: KeposPolicy,
+        credentials: CredentialTable,
+    ) -> Self {
         Self {
             db_path: Arc::new(db_path.into()),
             policy: Arc::new(policy),
+            credentials: Arc::new(credentials),
         }
     }
 }
@@ -73,12 +82,16 @@ fn route(path: &str) -> String {
     format!("/{path}")
 }
 
-fn store_for(state: &ServerState, principal: &KeposPrincipal) -> SqliteMemoryStore {
+fn store_for(state: &ServerState, principal: &Principal) -> SqliteMemoryStore {
     SqliteMemoryStore::new(state.db_path.as_path(), principal.namespace.clone())
 }
 
-async fn session(State(state): State<ServerState>, headers: HeaderMap) -> Response<Body> {
-    let principal = match authenticate(&state, &headers) {
+async fn session(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+) -> Response<Body> {
+    let principal = match authenticate(&state, &headers, peer) {
         Ok(principal) => principal,
         Err(error) => return error.into_response(),
     };
@@ -88,16 +101,17 @@ async fn session(State(state): State<ServerState>, headers: HeaderMap) -> Respon
         role: principal.role,
     })
     .into_response();
-    info!(operation = "session", namespace = %principal.namespace, role = ?principal.role, success = true, "remote memory operation");
+    info!(operation = "session", namespace = %principal.namespace, role = ?principal.role, source = ?principal.source, success = true, "remote memory operation");
     response
 }
 
 async fn scan(
     State(state): State<ServerState>,
     headers: HeaderMap,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     payload: Result<Json<ScanRequest>, JsonRejection>,
 ) -> Response<Body> {
-    let principal = match authenticate(&state, &headers) {
+    let principal = match authenticate(&state, &headers, peer) {
         Ok(principal) => principal,
         Err(error) => return error.into_response(),
     };
@@ -138,9 +152,10 @@ async fn scan(
 async fn read(
     State(state): State<ServerState>,
     headers: HeaderMap,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     payload: Result<Json<ReadRequest>, JsonRejection>,
 ) -> Response<Body> {
-    let principal = match authenticate(&state, &headers) {
+    let principal = match authenticate(&state, &headers, peer) {
         Ok(principal) => principal,
         Err(error) => return error.into_response(),
     };
@@ -161,8 +176,12 @@ async fn read(
     }
 }
 
-async fn list(State(state): State<ServerState>, headers: HeaderMap) -> Response<Body> {
-    let principal = match authenticate(&state, &headers) {
+async fn list(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+) -> Response<Body> {
+    let principal = match authenticate(&state, &headers, peer) {
         Ok(principal) => principal,
         Err(error) => return error.into_response(),
     };
@@ -176,9 +195,10 @@ async fn list(State(state): State<ServerState>, headers: HeaderMap) -> Response<
 async fn put(
     State(state): State<ServerState>,
     headers: HeaderMap,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     payload: Result<Json<PutRequest>, JsonRejection>,
 ) -> Response<Body> {
-    let principal = match authenticate(&state, &headers) {
+    let principal = match authenticate(&state, &headers, peer) {
         Ok(principal) => principal,
         Err(error) => return error.into_response(),
     };
@@ -220,9 +240,10 @@ async fn put(
 async fn delete(
     State(state): State<ServerState>,
     headers: HeaderMap,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     payload: Result<Json<DeleteRequest>, JsonRejection>,
 ) -> Response<Body> {
-    let principal = match authenticate(&state, &headers) {
+    let principal = match authenticate(&state, &headers, peer) {
         Ok(principal) => principal,
         Err(error) => return error.into_response(),
     };
@@ -248,9 +269,10 @@ async fn delete(
 async fn sync(
     State(state): State<ServerState>,
     headers: HeaderMap,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     payload: Result<Json<SyncRequest>, JsonRejection>,
 ) -> Response<Body> {
-    let principal = match authenticate(&state, &headers) {
+    let principal = match authenticate(&state, &headers, peer) {
         Ok(principal) => principal,
         Err(error) => return error.into_response(),
     };
@@ -274,9 +296,10 @@ async fn sync(
 async fn export(
     State(state): State<ServerState>,
     headers: HeaderMap,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     payload: Result<Json<ExportRequest>, JsonRejection>,
 ) -> Response<Body> {
-    let principal = match authenticate(&state, &headers) {
+    let principal = match authenticate(&state, &headers, peer) {
         Ok(principal) => principal,
         Err(error) => return error.into_response(),
     };
@@ -331,28 +354,49 @@ fn json_payload<T>(payload: Result<Json<T>, JsonRejection>) -> Result<T, ApiErro
     })
 }
 
-fn authenticate(state: &ServerState, headers: &HeaderMap) -> Result<KeposPrincipal, ApiError> {
+fn authenticate(
+    state: &ServerState,
+    headers: &HeaderMap,
+    peer: SocketAddr,
+) -> Result<Principal, ApiError> {
     let authorization = headers
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .ok_or_else(ApiError::unauthorized)?;
-    let public_key =
-        auth::parse_authorization(authorization).map_err(|_| ApiError::unauthorized())?;
-    let (namespace, role) = state
-        .policy
-        .resolve(&public_key)
+    let (scheme, value) = authorization
+        .split_once(' ')
         .ok_or_else(ApiError::unauthorized)?;
+    let (namespace, role, source) = if scheme.eq_ignore_ascii_case(auth::AUTH_SCHEME) {
+        let public_key =
+            auth::parse_authorization(authorization).map_err(|_| ApiError::unauthorized())?;
+        let (namespace, role) = state
+            .policy
+            .resolve(&public_key)
+            .ok_or_else(ApiError::unauthorized)?;
+        (namespace.to_owned(), role, AuthSource::Kepos)
+    } else if scheme.eq_ignore_ascii_case(auth::BEARER_SCHEME) {
+        if !peer.ip().is_loopback() || !auth::is_bearer_token(value) {
+            return Err(ApiError::unauthorized());
+        }
+        let (namespace, role) = state
+            .credentials
+            .resolve(value)
+            .ok_or_else(ApiError::unauthorized)?;
+        (namespace.to_owned(), role, AuthSource::Bearer)
+    } else {
+        return Err(ApiError::unauthorized());
+    };
     let asserted = headers
         .get(protocol::NAMESPACE_HEADER)
         .and_then(|value| value.to_str().ok())
         .ok_or_else(ApiError::namespace_mismatch)?;
-    if asserted != namespace {
+    if !protocol::is_valid_namespace(asserted) || asserted != namespace {
         return Err(ApiError::namespace_mismatch());
     }
-    Ok(KeposPrincipal {
-        public_key,
-        namespace: namespace.to_owned(),
+    Ok(Principal {
+        namespace,
         role,
+        source,
     })
 }
 
@@ -386,7 +430,7 @@ fn valid_snapshot(memories: &[tact_memory::MemoryRecord]) -> bool {
 
 /// Applies the 30-second store deadline and maps store failures to protocol errors.
 async fn run_store<T>(
-    principal: &KeposPrincipal,
+    principal: &Principal,
     operation: &'static str,
     future: impl Future<Output = Result<T, MemoryError>> + Send,
 ) -> Result<T, ApiError>
@@ -396,16 +440,16 @@ where
     match timeout(STORE_OPERATION_TIMEOUT, future).await {
         Err(_) => {
             let error = ApiError::unavailable();
-            info!(operation, namespace = %principal.namespace, role = ?principal.role, success = false, status = error.status.as_u16(), error_code = ?error.code, "remote memory operation");
+            info!(operation, namespace = %principal.namespace, role = ?principal.role, source = ?principal.source, success = false, status = error.status.as_u16(), error_code = ?error.code, "remote memory operation");
             Err(error)
         }
         Ok(Ok(value)) => {
-            info!(operation, namespace = %principal.namespace, role = ?principal.role, success = true, "remote memory operation");
+            info!(operation, namespace = %principal.namespace, role = ?principal.role, source = ?principal.source, success = true, "remote memory operation");
             Ok(value)
         }
         Ok(Err(source)) => {
             let error = ApiError::from(source);
-            info!(operation, namespace = %principal.namespace, role = ?principal.role, success = false, status = error.status.as_u16(), error_code = ?error.code, "remote memory operation");
+            info!(operation, namespace = %principal.namespace, role = ?principal.role, source = ?principal.source, success = false, status = error.status.as_u16(), error_code = ?error.code, "remote memory operation");
             Err(error)
         }
     }
@@ -484,7 +528,7 @@ impl IntoResponse for ApiError {
         if self.status == StatusCode::UNAUTHORIZED {
             response.headers_mut().insert(
                 header::WWW_AUTHENTICATE,
-                HeaderValue::from_static(auth::AUTH_SCHEME),
+                HeaderValue::from_static("Kepos, Bearer"),
             );
         }
         response
